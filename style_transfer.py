@@ -1,57 +1,114 @@
 import torch
+import torch.nn as nn
 import torch.optim as optim
-from torchvision import models
+from torchvision import models, transforms
+from PIL import Image
 import matplotlib.pyplot as plt
 
-# Load a pretrained VGG model for feature extraction
-vgg = models.vgg19(pretrained=True).features.eval()
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Define content and style loss functions
-def content_loss(target, content):
-    return torch.mean((target - content) ** 2)
+# Image preprocessing
+def load_image(path, max_size=256, shape=None):
+    image = Image.open(path).convert("RGB")
 
-def gram_matrix(feature_map):
-    _, C, H, W = feature_map.size()
-    features = feature_map.view(C, H * W)
-    return torch.mm(features, features.t()) / (C * H * W)
+    if shape is not None:
+        size = shape  # shape should be (height, width)
+    else:
+        size = (max_size, max_size)
 
-def style_loss(target, style):
-    return torch.mean((gram_matrix(target) - gram_matrix(style)) ** 2)
+    in_transform = transforms.Compose([
+        transforms.Resize(size),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406),
+                             (0.229, 0.224, 0.225))
+    ])
 
-# Train the model to optimize the style transfer
-# Initialize the image as a copy of the content image with gradients enabled
-from PIL import Image
-from torchvision import transforms
+    image = in_transform(image).unsqueeze(0)
+    return image.to(device)
 
-# Load and preprocess the content image
-content_image_path = "path_to_content_image.jpg"  # Replace with the actual path to your content image
-content_image = Image.open(content_image_path).convert("RGB")
-preprocess = transforms.Compose([
-    transforms.Resize((224, 224)),  # Resize to match VGG input size
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
-content_image = preprocess(content_image).unsqueeze(0)  # Add batch dimension
+# Un-normalize for display
+def im_convert(tensor):
+    image = tensor.clone().detach().cpu().squeeze(0)
+    image = image * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    image = image + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    image = image.clamp(0, 1)
+    return image.permute(1, 2, 0)
 
-# Load and preprocess the style image
-style_image_path = "path_to_style_image.jpg"  # Replace with the actual path to your style image
-style_image = Image.open(style_image_path).convert("RGB")
-style_image = preprocess(style_image).unsqueeze(0)  # Add batch dimension
+# Load images
+content_path = "image.jpg"
+style_path = "sample.jpg"
 
-image = content_image.clone().requires_grad_(True)
+content_image = load_image(content_path, max_size=256)
+style_image = load_image(style_path, shape=(content_image.shape[2], content_image.shape[3]))
 
-optimizer = optim.Adam([image], lr=0.01)
-for i in range(500):
-    target_content = vgg(content_image)
-    target_style = vgg(style_image)
-    loss = content_loss(target_content, content_image) + 1e6 * style_loss(target_style, style_image)
+# Load pretrained VGG19
+from torchvision.models import vgg19, VGG19_Weights
+vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features.to(device).eval()
+
+# Freeze parameters
+for param in vgg.parameters():
+    param.requires_grad_(False)
+
+# Define layers for content and style
+content_layers = ['21']  # conv4_2
+style_layers = ['0', '5', '10']  # conv1_1, conv2_1, conv3_1
+
+def get_features(image, model, layers):
+    features = {}
+    x = image
+    for name, layer in model._modules.items():
+        x = layer(x)
+        if name in layers:
+            features[name] = x
+    return features
+
+def gram_matrix(tensor):
+    _, d, h, w = tensor.size()
+    tensor = tensor.view(d, h * w)
+    return torch.mm(tensor, tensor.t()) / (d * h * w)
+
+# Extract features
+content_features = get_features(content_image, vgg, content_layers)
+style_features = get_features(style_image, vgg, style_layers)
+style_grams = {layer: gram_matrix(style_features[layer]) for layer in style_features}
+
+# Target image to optimize
+target = content_image.clone().requires_grad_(True)
+
+# Weights
+style_weights = {'0': 1.0, '5': 0.75, '10': 0.2}
+content_weight = 1e4
+style_weight = 1e2
+
+# Optimizer
+optimizer = optim.Adam([target], lr=0.003)
+
+# Training loop
+steps = 300
+for step in range(steps):
+    target_features = get_features(target, vgg, content_layers + style_layers)
+
+    content_loss = torch.mean((target_features['21'] - content_features['21']) ** 2)
+
+    style_loss = 0
+    for layer in style_layers:
+        target_feature = target_features[layer]
+        target_gram = gram_matrix(target_feature)
+        style_gram = style_grams[layer]
+        style_loss += style_weights[layer] * torch.mean((target_gram - style_gram) ** 2)
+
+    total_loss = content_weight * content_loss + style_weight * style_loss
 
     optimizer.zero_grad()
-    loss.backward()
+    total_loss.backward()
     optimizer.step()
 
-# Display final style-transferred image
-plt.imshow(image.squeeze().permute(1, 2, 0).detach().numpy())
+    if step % 50 == 0:
+        print(f"Step {step}, Total loss: {total_loss.item():.4f}")
+
+# Display final image
+plt.imshow(im_convert(target))
 plt.title("Stylized Image")
 plt.axis("off")
 plt.show()
